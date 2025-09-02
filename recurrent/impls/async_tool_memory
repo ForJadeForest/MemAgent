@@ -1,0 +1,367 @@
+import logging
+import re
+import json
+from typing import List, Optional, Tuple, Union, Dict
+from uuid import uuid4
+
+import torch
+from omegaconf import DictConfig
+from tensordict import TensorDict
+from transformers import PreTrainedTokenizer, ProcessorMixin
+from typing_extensions import override
+from recurrent.async_utils import ChatCompletionProxy
+
+
+from recurrent.interface import AsyncRAgent, RConfig, RDataset, RRegister, AsyncOutput
+from recurrent.utils import log_step, msg
+from verl.protocol import DataProtoItem
+from verl.trainer.ppo.ray_trainer import _timer
+import verl.utils.torch_functional as verl_F
+from recurrent.tool import ToolSchema, ToolCall, toolcall_system_prompt, toolcall_extract, merge_system_prompt
+
+
+logger = logging.getLogger(__file__)
+logger.setLevel('INFO')
+
+
+from recurrent.impls.memory import MemoryConfig, TEMPLATE, TEMPLATE_FINAL_BOXED
+
+# New templates for tool-calling memory agent
+TOOL_TEMPLATE = """You are an intelligent memory agent. Your final task is to answer a core question based on a long document. Because the document is too long, you will process it in chunks. After reading each chunk, your primary job is to update a concise yet comprehensive "memory" to prepare for the final answer.
+
+# Process for Each Chunk
+You must strictly follow this four-step process:
+
+1. **Analyze Inputs**: You will receive three pieces of information: [Core Question], [Previous Memory], and [Current Chunk].
+
+2. **Reason and Plan** (`<think>` ... `</think>`):
+   - First, you MUST reason within the `<think>` tags.
+   - Evaluate if the new information in the [Current Chunk] is relevant to the [Core Question].
+   - Compare the new information with your [Previous Memory]. What is new knowledge? What are supplementary details? What is redundant or irrelevant?
+   - Consider if you need tools to better integrate the information. For example, "I see a new concept, 'Project Nightingale'. I should search my memory to see if this has been mentioned before to avoid creating a duplicate entry."
+
+3. **Call Tools (Optional)**:
+   - If, after reasoning, you decide you need more context from the content you have already processed, you can call a tool.
+   - Use the available tools to search through previously processed chunks.
+   - You can call tools multiple times if needed. After each tool result, you should think again before acting.
+
+4. **Update Memory** (`<updated_memory>` ... `</updated_memory>`):
+   - After all reasoning and tool use is complete for the current chunk, you MUST generate a new, optimized memory inside the `<updated_memory>` tags.
+   - **Key Principle**: The memory must remain concise. Discard irrelevant, distracting information while ensuring all clues valuable for answering the [Core Question] are retained or refined.
+   - You must write the memory as the following format:
+   ```
+   <updated_memory>
+   [Your updated memory]
+   </updated_memory>
+   ```
+
+[Core Question]: {prompt}
+
+[Previous Memory]: 
+{memory}
+
+[Current Chunk]: 
+{chunk}"""
+
+TOOL_FINAL_TEMPLATE = """You are an intelligent memory agent. Your final task is to answer a core question based on a long document. Because the document is too long, you will process it in chunks. After reading each chunk, your primary job is to update a concise yet comprehensive "memory" to prepare for the final answer.
+
+# Final Answer
+When the [Current Chunk] you receive is the special token `[END OF DOCUMENT]`, it means the document has been fully processed. At this point, do not update the memory or call any tools. Instead, based on your final memory, provide the direct answer to the [Core Question] inside the `<answer>` tags.
+
+[Core Question]: {prompt}
+
+[Previous Memory]: 
+{memory}
+
+[Current Chunk]: 
+[END OF DOCUMENT]"""
+
+class AsyncMemoryDataset(RDataset):
+    """
+    We assume the dataset contains a column that contains prompts and other information
+    """
+    def __init__(
+        self,
+        recurrent_config: MemoryConfig,
+        data_files: Union[str, List[str]],
+        tokenizer: PreTrainedTokenizer,
+        data_config: DictConfig,
+        processor: Optional[ProcessorMixin] = None,
+    ):
+        if data_config.truncation != 'center':
+            raise ValueError('MemoryDataset only support center truncation')
+        data_config.max_prompt_length=recurrent_config.max_chunks * recurrent_config.chunk_size
+        self.context_key = recurrent_config.context_key
+        super().__init__(
+            recurrent_config=recurrent_config,
+            data_files=data_files,
+            tokenizer=tokenizer,
+            data_config=data_config,
+            processor=processor,
+        )
+
+
+    @override
+    def __getitem__(self, item):
+        """
+        Note that we also return the raw_input_ids so that it can be combined with other chat template
+        """
+        row_dict: dict = self.dataframe[item]
+
+        chat = row_dict.pop(self.prompt_key)
+        context = row_dict.pop(self.context_key)
+
+        model_inputs = self.tokenizer(context, return_tensors="pt", add_special_tokens=False)
+
+        context_ids = model_inputs.pop("input_ids")
+        attention_mask = model_inputs.pop("attention_mask")
+
+        context_ids, attention_mask = verl_F.postprocess_data(
+            input_ids=context_ids,
+            attention_mask=attention_mask,
+            max_length=self.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id, # pyright: ignore
+            left_pad=False,
+            truncation=self.truncation,
+        )
+
+        row_dict["context_ids"] = context_ids[0]
+        lengths = attention_mask.sum(dim=-1)
+        row_dict["context_length"] = lengths[0]
+        row_dict["prompt"] = chat[0]["content"]
+        index = row_dict.get("extra_info", {}).get("index", 0)
+        row_dict["index"] = index
+        row_dict["sample_uuid"] = str(uuid4())
+
+        return row_dict
+
+    @override
+    def get_bactch_keys(self) -> Tuple[List[str], List[str]]:
+         # tensor can use 2-deminsional index for chunking.
+         # while prompt will not be indexed, so keep it as list.
+        return ["context_ids", "context_length"], ["prompt"]
+
+
+class AsyncMemoryAgent(AsyncRAgent):
+    """
+    Tool-calling memory agent that can use tools to better integrate information across chunks
+    """
+    TOOLS = [
+        ToolSchema(
+            name="search_memory",
+            description="Search for a query string in all previously processed chunks to find relevant information",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The keywords to search for in previously processed chunks.",
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        ToolSchema(
+            name="similarity_check",
+            description="Find content semantically similar to a given text from all previously processed chunks",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to check for similarity in previously processed chunks",
+                    },
+                },
+                "required": ["text"],
+            },
+        )
+    ]
+    
+    def __init__(self, proxy: ChatCompletionProxy, tokenizer: PreTrainedTokenizer, config: RConfig, rollout_config: DictConfig):
+        self.system_msg = toolcall_system_prompt(self.TOOLS)
+        super().__init__(proxy, tokenizer, config, rollout_config)
+        
+    def _extract_updated_memory(self, response: str) -> Optional[str]:
+        """Extract updated memory from model response"""
+        memory_pattern = r'<updated_memory>(.*?)</updated_memory>'
+        match = re.search(memory_pattern, response, re.DOTALL)
+        return match.group(1).strip() if match else None
+    
+    def _extract_answer(self, response: str) -> Optional[str]:
+        """Extract final answer from model response"""
+        answer_pattern = r'<answer>(.*?)</answer>'
+        match = re.search(answer_pattern, response, re.DOTALL)
+        return match.group(1).strip() if match else None
+    
+    async def tool_message(self, tool_call: ToolCall, processed_chunks: List[str]) -> Dict[str, str]:
+        """Execute a tool call and return the result message"""
+        if tool_call.name == "search_memory":
+            query = tool_call.args.get("query", "")
+            # Simple keyword search in processed chunks
+            results = []
+            for i, chunk in enumerate(processed_chunks):
+                if query.lower() in chunk.lower():
+                    results.append(f"Chunk {i+1}: {chunk[:200]}...")
+            content = f"Found {len(results)} matches for '{query}':\n" + "\n".join(results) if results else f"No matches found for '{query}'"
+            return {"role": "tool", "content": content}
+            
+        elif tool_call.name == "similarity_check":
+            text = tool_call.args.get("text", "")
+            # Simple similarity check (could be enhanced with embeddings)
+            results = []
+            for i, chunk in enumerate(processed_chunks):
+                # Simple word overlap similarity
+                chunk_words = set(chunk.lower().split())
+                text_words = set(text.lower().split())
+                overlap = len(chunk_words.intersection(text_words))
+                if overlap > 0:
+                    similarity = overlap / len(text_words)
+                    if similarity > 0.1:  # Threshold for similarity
+                        results.append(f"Chunk {i+1} (similarity: {similarity:.2f}): {chunk[:200]}...")
+            content = f"Found {len(results)} similar chunks:\n" + "\n".join(results) if results else f"No similar chunks found for the given text"
+            return {"role": "tool", "content": content}
+            
+        elif tool_call.name == ToolSchema.INVALID_TOOL:
+            return {"role": "tool", "content": f"Invalid tool call: {tool_call.args.get('msg', 'Unknown error')}"}
+        else:
+            return {"role": "tool", "content": f"Unknown tool: {tool_call.name}"}
+    
+    @override
+    async def rollout(self, gen_item: DataProtoItem) -> AsyncOutput:
+        """
+        tensor keys in output:
+        - standard verl: "prompts", "responses", "input_ids", "attention_mask", "position_ids"
+        - recurrent rl: "sample_index", "final_mask"
+        > input_ids = torch.cat([prompts, responses], dim=1)
+        """
+        timing_raw = {}
+        sample_index = gen_item.batch['sample_index'].item()
+        context_length = gen_item.batch["context_length"].item()
+        step = 0
+        conversations = []
+        memory = None
+        processed_chunks = []  # Store processed chunks for tool access
+        
+        while True:
+            with _timer('mt_mics', timing_raw):
+                if step * self.config.chunk_size >= context_length:
+                    break
+                assert step < self.config.max_chunks, f"{step=} exceeds {self.config.max_chunks=}, {context_length=}"
+                chunk_ids = gen_item.batch["context_ids"]\
+                    [step * self.config.chunk_size: (step + 1) * self.config.chunk_size]
+                
+                chunk_text = self.tokenizer.decode(chunk_ids, skip_special_tokens=True)
+                processed_chunks.append(chunk_text)
+                
+                # Start conversation for this chunk
+                conversation = [
+                    {"role": "user", "content": TOOL_TEMPLATE.format(
+                        prompt=gen_item.non_tensor_batch["prompt"],
+                        memory=memory if memory else "No previous memory",
+                        chunk=chunk_text,
+                    )}
+                ]
+                
+                # Add system prompt with tools
+                conversation = merge_system_prompt(conversation, self.system_msg)
+                
+                # Multi-turn conversation within this chunk until we get updated_memory
+                chunk_conversation = []
+                max_turns = 3
+                while max_turns > 0:
+                    kwargs = self.sampling_params(gen_item.meta_info)
+                    if sample_index == 0 and len(chunk_conversation) == 0:
+                        logger.info(f"generate_sequences sampling params: {kwargs}")
+                    
+                    self.config : MemoryConfig
+                    kwargs["max_completion_tokens"] = self.config.max_memorization_length
+                    kwargs["stop"] = ["</tool_call>", "<updated_memory>"]
+                    
+                    with _timer('mt_async_gen', timing_raw):
+                        completions, err = await self.proxy.get_chat_completions(
+                            messages=conversation,
+                            **kwargs
+                        )
+                        if err:
+                            raise err
+                    
+                    with _timer('mt_mics', timing_raw):
+                        choice = completions.choices[0]
+                        response_content = choice.message.content
+                        conversation.append({"role": "assistant", "content": response_content})
+                        chunk_conversation.append(response_content)
+                        
+                        if sample_index == 0:
+                            log_step(logger, step, conversation)
+                        
+                        # Check if we have updated_memory
+                        updated_memory = self._extract_updated_memory(response_content)
+                        if updated_memory:
+                            memory = updated_memory
+                            break
+                        
+                        # Check if we have tool calls
+                        tool_call = toolcall_extract(response_content)
+                        if tool_call:
+                            # Execute tool and add result to conversation
+                            tool_msg = await self.tool_message(tool_call, processed_chunks)
+                            print(tool_msg)
+                            conversation.append(tool_msg)
+                            
+                        else:
+                            # No tool calls and no updated_memory, continue conversation
+                            conversation.append({
+                                "role": "user", 
+                                "content": "Please continue with your reasoning and provide the <updated_memory> for this chunk."
+                            })
+                        max_turns -= 1
+                
+                conversations.append(conversation)
+                step += 1
+
+        # Final turn
+        with _timer('mt_mics', timing_raw):
+            conversation = [
+                {
+                    "role": "user",
+                    "content": TOOL_FINAL_TEMPLATE.format(
+                        prompt=gen_item.non_tensor_batch["prompt"],
+                        memory=memory if memory else "No previous memory",
+                    ),
+                }
+            ]
+            kwargs["max_completion_tokens"] = self.config.max_final_response_length
+            
+            with _timer('mt_async_gen', timing_raw):
+                completions, err = await self.proxy.get_chat_completions(
+                    messages=conversation,
+                    **kwargs
+                )
+            
+            with _timer('mt_mics', timing_raw):
+                if err:
+                    raise err
+                choice = completions.choices[0]
+                response_content = choice.message.content
+                conversation.append({"role": "assistant", "content": response_content})
+                conversations.append(conversation)
+                
+                if sample_index == 0:
+                    log_step(logger, step, conversation)
+                
+                # Extract final answer
+                final_answer = self._extract_answer(response_content)
+                if not final_answer:
+                    logger.warning("No final answer found in response")
+                    final_answer = "Unable to provide a final answer based on the processed information."
+
+                sample_index = torch.full((len(conversations),), sample_index, dtype=torch.long)
+                final_mask = torch.full((len(conversations),), False, dtype=torch.bool)
+                final_mask[-1] = True
+                
+        return AsyncOutput(conversations, sample_index, final_mask, timing_raw)
+
+
+# Important, we will import `REGISTER` from this file to get all registered classes.
+# specified by recurrent.path / recurrent.name(defaults to REGISTER)
+REGISTER = RRegister(config_cls=MemoryConfig, dataset_cls=AsyncMemoryDataset, agent_cls=AsyncMemoryAgent)
