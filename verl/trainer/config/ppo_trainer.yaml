@@ -256,5 +256,16 @@ recurrent:
     config:
       max_turn: 5
       max_generation_per_turn: 256
+  tool_memory:
+    async_path: "recurrent/impls/async_tool_memory.py"
+    async_name: REGISTER
+    config:
+      context_key: context  # Column name in dataset containing the long document context
+      chunk_size: 5000      # Number of tokens per chunk when processing long documents
+      max_prompt_length: 1024  # Maximum length for the initial prompt/question
+      max_memorization_length: 1024  # Maximum tokens for memory updates during chunk processing
+      max_chunks: 8         # Maximum number of chunks to process (max_chunks * chunk_size = max document length)
+      max_final_response_length: 1024  # Maximum tokens for the final answer
+
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
